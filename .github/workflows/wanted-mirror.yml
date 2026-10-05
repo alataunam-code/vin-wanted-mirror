@@ -77,7 +77,10 @@ jobs:
               g.write('vin;brand;model;color;plate;date\n')
               g.write('\n'.join(rows[k] for k in sorted(rows)) + '\n')
           with open('out/updated.txt', 'w') as t:
-              t.write('%s %d\n' % (datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC'), len(rows)))
+              t.write('%s %d\n' % (datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M UTC'), len(rows)))
+          with open('out/SOURCE.txt', 'w', encoding='utf-8') as t:
+              t.write('Джерело: МВС України, «Відомості про транспортні засоби, що перебувають у розшуку», data.gov.ua/dataset/' + DATASET + '\n'
+                      'Ліцензія: Creative Commons Attribution 4.0 (CC BY 4.0). Дані перетворено: залишено записи з VIN.\n')
           print('VIN в базе:', len(rows))
           PY
 
@@ -289,6 +292,9 @@ jobs:
                   f.write(code + ';' + ops[code] + '\n')
           with open(OUT + '/info.txt', 'w', encoding='utf-8') as f:
               f.write('%s;%d;%d;%s\n' % (stamp or datetime.date.today().isoformat(), rows, vins, datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M UTC')))
+          with open(OUT + '/SOURCE.txt', 'w', encoding='utf-8') as f:
+              f.write('Джерело: МВС України, «Відомості про транспортні засоби та їх власників», data.gov.ua/dataset/' + DATASET + '\n'
+                      'Ліцензія: Creative Commons Attribution 4.0 (CC BY 4.0). Дані перетворено: записи з VIN з 2021 року, згруповано за VIN, без номерних знаків.\n')
           print('строк:', rows, 'VIN:', vins)
           PY
 
