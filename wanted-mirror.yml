@@ -1,0 +1,92 @@
+# Зеркало базы розыска МВД Украины для плагина «VIN-проверка» (Osclass).
+#
+# Зачем: data.gov.ua не пускает серверы из России, а хостинг сайта там.
+# GitHub раз в сутки скачивает базу (из США её отдают), оставляет только машины с VIN,
+# сжимает (~1–2 МБ) и выкладывает в ветку «data». Плагин берёт файл отсюда — GitHub из России открывается.
+#
+# Как подключить (один раз, бесплатно):
+#  1. github.com → New repository → имя, например, vin-wanted-mirror → Public → Create.
+#  2. Add file → Create new file → путь .github/workflows/wanted-mirror.yml → вставить этот файл → Commit.
+#  3. Вкладка Actions → «Зеркало базы розыска» → Run workflow (первый запуск вручную, дальше — сам каждый день).
+#  4. Через 1–2 минуты в настройках плагина «Адрес зеркала базы розыска» указать:
+#     https://raw.githubusercontent.com/ВАШ_ЛОГИН/vin-wanted-mirror/data/wanted-ua.csv.gz
+#
+# Формат файла: строки «VIN;марка;модель;цвет;номер;дата угона», gzip.
+
+name: Зеркало базы розыска
+
+on:
+  schedule:
+    - cron: '20 3 * * *'      # каждый день в 03:20 UTC
+  workflow_dispatch:           # кнопка «Run workflow»
+
+permissions:
+  contents: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Скачать базу с data.gov.ua и упаковать
+        run: |
+          mkdir -p out
+          python3 - <<'PY'
+          import gzip, json, re, sys, urllib.request, datetime
+
+          DATASET = 'ac1a3a9d-512b-446b-9b0c-1383d38ce474'
+          UA = {'User-Agent': 'vin-wanted-mirror (GitHub Actions)'}
+
+          def get(url, timeout=120):
+              with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=timeout) as r:
+                  return r.read()
+
+          meta = json.loads(get('https://data.gov.ua/api/3/action/package_show?id=' + DATASET))
+          url = next(r['url'] for r in meta['result']['resources']
+                     if 'carswanted' in (r.get('name') or '').lower() and 'schema' not in (r.get('name') or '').lower())
+          data = json.loads(get(url, 600).decode('utf-8-sig'))
+
+          # как vinc_normalize() в плагине: кириллица → латиница, без пробелов и дефисов, I/O/Q → 1/0/0
+          cyr = str.maketrans({'А': 'A', 'В': 'B', 'Е': 'E', 'К': 'K', 'М': 'M', 'Н': 'H', 'О': '0', 'Р': 'P', 'С': 'C', 'Т': 'T', 'У': 'Y', 'Х': 'X',
+                               'O': '0', 'I': '1', 'Q': '0'})
+          ok = re.compile(r'^[A-HJ-NPR-Z0-9]{17}$')
+          clean = lambda s: re.sub(r'[;\r\n]+', ' ', str(s or '')).strip()
+
+          rows = {}
+          for o in data:
+              for f in ('bodynumber', 'chassisnumber'):
+                  v = re.sub(r'[\s\-.]+', '', str(o.get(f) or '').upper()).translate(cyr)
+                  if ok.match(v):
+                      rows[v] = ';'.join([v, clean(o.get('brand')), clean(o.get('model')), clean(o.get('color')),
+                                          clean(o.get('vehiclenumber')), clean(o.get('illegalseizuredate'))[:10]])
+
+          if len(rows) < 1000:
+              sys.exit('слишком мало записей: %d — не публикуем' % len(rows))
+
+          with gzip.open('out/wanted-ua.csv.gz', 'wt', encoding='utf-8') as g:
+              g.write('vin;brand;model;color;plate;date\n')
+              g.write('\n'.join(rows[k] for k in sorted(rows)) + '\n')
+          with open('out/updated.txt', 'w') as t:
+              t.write('%s %d\n' % (datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC'), len(rows)))
+          print('VIN в базе:', len(rows))
+          PY
+
+      - name: Выложить в ветку data (без истории — репозиторий не растёт)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd out
+          git init -q
+          git checkout -q -b data
+          git add .
+          git -c user.name='mirror-bot' -c user.email='mirror-bot@users.noreply.github.com' commit -qm "data $(date -u +%F)"
+          git push -qf "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" data
+
+      - name: Отметка о запуске (иначе GitHub выключает ежедневные задачи через 60 дней тишины)
+        run: |
+          date -u +%F > last-run.txt
+          git add last-run.txt
+          git -c user.name='mirror-bot' -c user.email='mirror-bot@users.noreply.github.com' commit -qm "last run $(date -u +%F)" || exit 0
+          git push -q
