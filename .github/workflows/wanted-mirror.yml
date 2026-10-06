@@ -7,6 +7,10 @@
 #  2) Реестр транспортных средств МВД (история регистраций с 2021 года, ~11 млн записей) — раз в неделю
 #     проверяет, вышли ли новые данные (обычно раз в месяц), и раскладывает их на 1024 файла по VIN, ветка «ua-reg».
 #     Плагин на одну проверку берёт один файл ~100–200 КБ.
+#  3) Реестр транспортных средств Чехии (открытые данные Минтранса ЧР) — раз в неделю проверяет новую выгрузку
+#     (выходит раз в месяц) и раскладывает её по VIN, ветка «cz-reg». Первый запуск — 1–4 часа (файлы большие).
+#  4) EU Safety Gate — отзывы машин в ЕС, каждую субботу новые недели, ветка «eu-recalls» (файл на марку).
+#     Первый запуск ~20 минут (все отчёты с 2005 года), дальше — минута.
 #
 # Как подключить (один раз, бесплатно):
 #  1. github.com → New repository → имя, например, vin-wanted-mirror → Public → Create.
@@ -24,7 +28,9 @@ name: Зеркало для VIN-проверки
 on:
   schedule:
     - cron: '20 3 * * *'      # розыск — каждый день в 03:20 UTC
-    - cron: '40 4 * * 1'      # реестр — по понедельникам в 04:40 UTC (если вышли новые данные)
+    - cron: '40 4 * * 1'      # реестр Украины — по понедельникам в 04:40 UTC (если вышли новые данные)
+    - cron: '10 5 * * 2'      # реестр Чехии — по вторникам в 05:10 UTC (если вышла новая выгрузка)
+    - cron: '30 6 * * 6'      # отзывы ЕС — по субботам в 06:30 UTC
   workflow_dispatch:           # кнопка «Run workflow» — обновить всё сразу
 
 permissions:
@@ -309,3 +315,422 @@ jobs:
           git add .
           git -c user.name='mirror-bot' -c user.email='mirror-bot@users.noreply.github.com' commit -qm "ua-reg $(date -u +%F)"
           git push -qf "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" ua-reg
+
+  czech:
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '10 5 * * 2'
+    runs-on: ubuntu-latest
+    timeout-minutes: 345
+    steps:
+      - name: Реестр Чехии → файлы по VIN
+        env:
+          REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          # большие файлы — на диск /mnt (там больше места)
+          sudo mkdir -p /mnt/cz && sudo chown -R "$USER" /mnt/cz
+          NEW=$(curl -sI https://download.dataovozidlech.cz/vypiszregistru/vypisvozidel | grep -io 'filename=[^;]*' | grep -o '[0-9]\{8\}' | head -1)
+          OLD=$(curl -s "https://raw.githubusercontent.com/$REPO/cz-reg/info.txt" | cut -d';' -f1 | tr -d '-')
+          echo "выгрузка Минтранса: $NEW, на зеркале: $OLD"
+          if [ -n "$NEW" ] && [ "$NEW" = "$OLD" ] && [ "$EVENT" != "workflow_dispatch" ]; then echo "реестр не менялся — пропускаю"; exit 0; fi
+          export CZ_STAMP="${NEW:0:4}-${NEW:4:2}-${NEW:6:2}"
+          [ -n "$NEW" ] || export CZ_STAMP=""
+          cat > /mnt/cz/cz_registry.py <<'PY'
+          # Реестр транспортных средств Чехии (открытые данные Минтранса ЧР, download.dataovozidlech.cz) → куски по VIN для плагина «VIN-проверка».
+          # Запускается задачей «czech» в mirror/wanted-mirror.yml (GitHub Actions) или вручную:
+          #   python3 cz_registry.py OUT_DIR [TMP_DIR] [LIMIT_MB]
+          # LIMIT_MB — для проверки: читать только начало каждого файла.
+          #
+          # Строка куска (как читает open_data.php → vinc_ad_cz):
+          #   VIN|марка|модель|год|1-я рег.|1-я рег. в ЧР|статус|цвет|топливо|кВт|см3|категория|ввоз|снятия|владельцы|техосмотры|место прекращения
+          #   ввоз: страна~дата;…  снятия: с~по~причина~место;…  владельцы: с~по~тип~отношение;…  техосмотры: дата~до~тип~оценка~город;…
+          # Имена, адреса и IČO владельцев не сохраняются — только тип (1 человек, 2 организация, 3 иное) и даты.
+          import csv, datetime, gzip, hashlib, io, os, re, sys, collections, urllib.request, concurrent.futures
+
+          BASE = 'https://download.dataovozidlech.cz/vypiszregistru/'
+          UA = {'User-Agent': 'vin-wanted-mirror (GitHub Actions)', 'Accept-Encoding': 'gzip'}
+          SHARDS = 1024
+          BUCKETS = 64
+          OUT = sys.argv[1] if len(sys.argv) > 1 else 'out/cz-reg'
+          TMP = sys.argv[2] if len(sys.argv) > 2 else 'tmp-cz'
+          LIMIT = int(sys.argv[3]) * 1024 * 1024 if len(sys.argv) > 3 else 0
+          csv.field_size_limit(10 ** 7)
+          os.makedirs(OUT, exist_ok=True)
+          os.makedirs(TMP, exist_ok=True)
+
+          VIN_OK = re.compile(r'^[A-HJ-NPR-Z0-9]{17}$')
+          FIX = str.maketrans({'O': '0', 'I': '1', 'Q': '0'})
+
+
+          def norm_vin(v):
+              v = re.sub(r'[\s\-.]+', '', (v or '').upper()).translate(FIX)
+              return v if VIN_OK.match(v) else ''
+
+
+          def clean(s):
+              return re.sub(r'[|;~\r\n\t]+', ' ', (s or '')).strip()
+
+
+          def day(s):
+              s = (s or '').strip()
+              m = re.match(r'^(\d{4})-(\d{2})-(\d{2})', s)
+              if m:
+                  return m.group(0)
+              m = re.match(r'^(\d{1,2})\.(\d{1,2})\.(\d{4})', s)
+              if m:
+                  return '%s-%02d-%02d' % (m.group(3), int(m.group(2)), int(m.group(1)))
+              return ''
+
+
+          def shard_of(vin):
+              return '%03x' % (int(hashlib.md5(vin.encode()).hexdigest()[:3], 16) % SHARDS)
+
+
+          class Limited(io.RawIOBase):
+              # читает не больше LIMIT байт (для проверки на начале файлов)
+              def __init__(self, raw, limit):
+                  self.raw, self.left = raw, limit
+              def readable(self):
+                  return True
+              def readinto(self, b):
+                  if self.left <= 0:
+                      return 0
+                  n = self.raw.readinto(memoryview(b)[:min(len(b), self.left)])
+                  self.left -= n or 0
+                  return n
+
+
+          def download(name):
+              path = os.path.join(TMP, name + '.csv.gz')
+              req = urllib.request.Request(BASE + name, headers=UA)
+              with urllib.request.urlopen(req, timeout=600) as r, open(path, 'wb') as f:
+                  gz = (r.headers.get('Content-Encoding') or '').lower() == 'gzip'
+                  src = Limited(r, LIMIT) if LIMIT else r
+                  if gz:
+                      while True:
+                          b = src.read(1 << 20)
+                          if not b:
+                              break
+                          f.write(b)
+                  else:
+                      with gzip.GzipFile(fileobj=f, mode='wb', compresslevel=1) as g:
+                          while True:
+                              b = src.read(1 << 20)
+                              if not b:
+                                  break
+                              g.write(b)
+              print('скачан', name, os.path.getsize(path) // 1048576, 'МБ (сжато)', flush=True)
+              return path
+
+
+          def rows(path):
+              f = gzip.open(path, 'rb')
+              t = io.TextIOWrapper(f, encoding='utf-8-sig', errors='replace', newline='')
+              rd = csv.reader(t)
+              try:
+                  hdr = [h.strip() for h in next(rd)]
+              except StopIteration:
+                  return
+              ix = {h: i for i, h in enumerate(hdr)}
+              try:
+                  for r in rd:
+                      yield ix, r
+              except (EOFError, gzip.BadGzipFile):
+                  if not LIMIT:
+                      raise   # обрезанный файл допустим только в проверочном запуске
+              t.close()
+
+
+          def col(ix, r, name):
+              i = ix.get(name)
+              return r[i] if i is not None and i < len(r) else ''
+
+
+          # ---------- скачиваем все пять файлов параллельно ----------
+          names = ['vypisvozidel', 'vozidladovoz', 'vozidlavyrazenazprovozu', 'vlastnikprovozovatelvozidla', 'technickeprohlidky']
+          with concurrent.futures.ThreadPoolExecutor(5) as ex:
+              paths = dict(zip(names, ex.map(download, names)))
+
+          buckets = [open(os.path.join(TMP, 'b%02d.txt' % i), 'w', encoding='utf-8') for i in range(BUCKETS)]
+          def put(vin, rec):
+              buckets[int(shard_of(vin), 16) * BUCKETS // SHARDS].write(vin + '\t' + rec + '\n')
+
+          # ---------- 1. машины: только легковые и лёгкие грузовые (M1, N1) ----------
+          pcv2vin = {}
+          cars = 0
+          for ix, r in rows(paths['vypisvozidel']):
+              cat = col(ix, r, 'Kategorie vozidla').strip().upper()
+              if not (cat.startswith('M1') or cat.startswith('N1')):
+                  continue
+              vin = norm_vin(col(ix, r, 'VIN'))
+              if not vin:
+                  continue
+              try:
+                  pcv = int(col(ix, r, 'PČV'))
+              except ValueError:
+                  continue
+              pcv2vin[pcv] = vin
+              kw = re.match(r'\s*(\d+)', col(ix, r, 'Max. výkon [kW] / [min⁻¹]'))
+              ccm = re.sub(r'\D', '', col(ix, r, 'Zdvihový objem [cm³]'))[:5]
+              put(vin, 'C\t' + '\t'.join([
+                  clean(col(ix, r, 'Tovární značka')), clean(col(ix, r, 'Obchodní označení')), re.sub(r'\D', '', col(ix, r, 'Rok výroby'))[:4],
+                  day(col(ix, r, 'Datum 1. registrace')), day(col(ix, r, 'Datum 1. registrace v ČR')), clean(col(ix, r, 'Status')),
+                  clean(col(ix, r, 'Barva')), clean(col(ix, r, 'Palivo')), (kw.group(1) if kw else ''), ccm, cat[:4], clean(col(ix, r, 'RM zániku'))]))
+              cars += 1
+          print('машин M1/N1 с VIN:', cars, flush=True)
+          if cars < (1000 if LIMIT else 1000000):
+              sys.exit('слишком мало машин: %d — не публикуем' % cars)
+          os.remove(paths['vypisvozidel'])
+
+          # ---------- 2. ввоз, снятия, владельцы, техосмотры ----------
+          def link(name, tag, make):
+              n = 0
+              for ix, r in rows(paths[name]):
+                  try:
+                      vin = pcv2vin.get(int(col(ix, r, 'PČV')))
+                  except ValueError:
+                      continue
+                  if not vin:
+                      continue
+                  rec = make(ix, r)
+                  if rec is not None:
+                      put(vin, tag + '\t' + rec)
+                      n += 1
+              os.remove(paths[name])
+              print(name, 'записей:', n, flush=True)
+
+          link('vozidladovoz', 'I', lambda ix, r: clean(col(ix, r, 'Stát')) + '~' + day(col(ix, r, 'Datum dovozu')))
+          link('vozidlavyrazenazprovozu', 'D', lambda ix, r: '~'.join([day(col(ix, r, 'Datum od')), day(col(ix, r, 'Datum do')), clean(col(ix, r, 'Důvod')), clean(col(ix, r, 'RM Název'))]))
+          # владелец (1) — без имён и адресов
+          link('vlastnikprovozovatelvozidla', 'O', lambda ix, r: None if col(ix, r, 'Vztah k vozidlu').strip()[:1] != '1' else
+               '~'.join([day(col(ix, r, 'Datum od')), day(col(ix, r, 'Datum do')), col(ix, r, 'Typ subjektu').strip()[:1], '1']))
+
+          def insp(ix, r):
+              typ = col(ix, r, 'Typ').strip()[:1].upper()
+              if typ in ('', 'A'):
+                  return None
+              state = col(ix, r, 'Stav').strip()[:1].upper()
+              city = clean(col(ix, r, 'Název STK')).split(',')[-1].strip()
+              return '~'.join([day(col(ix, r, 'Platnost od')), day(col(ix, r, 'Platnost do')), typ, state if state in ('A', 'B', 'C') else '', city])
+          link('technickeprohlidky', 'T', insp)
+
+          for b in buckets:
+              b.close()
+          del pcv2vin
+
+          # ---------- 3. по кускам: одна строка на VIN ----------
+          vins = 0
+          for i in range(BUCKETS):
+              per = collections.defaultdict(lambda: collections.defaultdict(list))
+              with open(os.path.join(TMP, 'b%02d.txt' % i), encoding='utf-8') as f:
+                  for line in f:
+                      vin, tag, rec = line.rstrip('\n').split('\t', 2)
+                      per[shard_of(vin)][vin].append((tag, rec))
+              os.remove(os.path.join(TMP, 'b%02d.txt' % i))
+              for sh, byvin in per.items():
+                  out = []
+                  for vin in sorted(byvin):
+                      recs = byvin[vin]
+                      cars_ = [r.split('\t') for t, r in recs if t == 'C']
+                      if not cars_:
+                          continue
+                      # у машины бывает несколько записей (перерегистрация) — берём действующую или самую свежую
+                      cars_.sort(key=lambda c: (c[5].upper().startswith('PROVOZ'), c[4] or c[3]))
+                      c = cars_[-1]
+                      first = min([x[3] for x in cars_ if x[3]] or [''])
+                      first_cz = min([x[4] for x in cars_ if x[4]] or [''])
+                      uniq = lambda tag: sorted(set(r for t, r in recs if t == tag))
+                      imports = uniq('I')
+                      deregs = sorted(uniq('D'))
+                      owners = sorted(uniq('O'))
+                      insps = sorted(uniq('T'))[-40:]
+                      out.append('|'.join([vin, c[0], c[1], c[2], first, first_cz, c[5], c[6], c[7], c[8], c[9], c[10],
+                                           ';'.join(imports), ';'.join(deregs), ';'.join(owners), ';'.join(insps), c[11]]))
+                  vins += len(out)
+                  with gzip.open(os.path.join(OUT, sh + '.gz'), 'wt', encoding='utf-8', compresslevel=9, newline='\n') as g:
+                      g.write('\n'.join(out) + '\n')
+
+          for s in range(SHARDS):
+              p = os.path.join(OUT, '%03x.gz' % s)
+              if not os.path.exists(p):
+                  with gzip.open(p, 'wt', encoding='utf-8') as g:
+                      g.write('')
+
+          stamp = os.environ.get('CZ_STAMP', '') or datetime.date.today().isoformat()   # дата выгрузки Минтранса (из имени файла)
+          with open(os.path.join(OUT, 'info.txt'), 'w', encoding='utf-8') as f:
+              f.write('%s;%d;%s\n' % (stamp, vins, datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M UTC')))
+          with open(os.path.join(OUT, 'SOURCE.txt'), 'w', encoding='utf-8') as f:
+              f.write('Zdroj: Ministerstvo dopravy ČR, Registr silničních vozidel — otevřená data (download.dataovozidlech.cz), zákon č. 106/1999 Sb.\n'
+                      'Data upravena: jen M1/N1 s VIN, seskupeno podle VIN, bez jmen, adres a IČO vlastníků.\n')
+          print('VIN в кусках:', vins)
+          PY
+          python3 /mnt/cz/cz_registry.py /mnt/cz/out/cz-reg /mnt/cz/tmp
+
+      - name: Выложить в ветку cz-reg (без истории — репозиторий не растёт)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ ! -f /mnt/cz/out/cz-reg/info.txt ]; then echo "новых данных нет"; exit 0; fi
+          cd /mnt/cz/out/cz-reg
+          git init -q
+          git checkout -q -b cz-reg
+          git add .
+          git -c user.name='mirror-bot' -c user.email='mirror-bot@users.noreply.github.com' commit -qm "cz-reg $(date -u +%F)"
+          git push -qf "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" cz-reg
+
+  eurecalls:
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '30 6 * * 6'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: EU Safety Gate → отзывы машин по маркам
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          mkdir -p out
+          cat > eu_recalls.py <<'PY'
+          # EU Safety Gate (Еврокомиссия): отзывы машин → файлы по маркам для плагина «VIN-проверка».
+          # Запускается задачей «eurecalls» в mirror/wanted-mirror.yml (GitHub Actions) или вручную:
+          #   python3 eu_recalls.py OUT_DIR [PREV_URL] [MAX_REPORTS]
+          # PREV_URL — адрес уже готовой ветки (…/eu-recalls/): оттуда берутся старые отзывы и список обработанных недель,
+          # поэтому каждую неделю скачиваются только новые еженедельные отчёты. MAX_REPORTS — для проверки.
+          # Файл марки: OUT_DIR/{марка}.json.gz — список {c: номер, d: дата, b: марка, m: модель, t: тип/одобрение, p: даты выпуска,
+          #   r: риск, x: описание опасности, s: меры, k: код отзыва производителя, n: страна уведомления, o: страна происхождения, u: ссылка}
+          import concurrent.futures, datetime, gzip, json, os, re, sys, unicodedata, urllib.request, xml.etree.ElementTree as ET
+
+          LIST = 'https://ec.europa.eu/safety-gate-alerts/api/download/weeklyReport/list/xml/en'
+          UA = {'User-Agent': 'vin-wanted-mirror (GitHub Actions)'}
+          OUT = sys.argv[1] if len(sys.argv) > 1 else 'out/eu-recalls'
+          PREV = sys.argv[2] if len(sys.argv) > 2 else ''
+          MAX = int(sys.argv[3]) if len(sys.argv) > 3 else 0
+          os.makedirs(OUT, exist_ok=True)
+
+          # марки: «Ford Motor Company», «Ford-Werke GmbH» → ford. Как vinc_brand_slug() в плагине.
+          BRANDS = ['alfaromeo', 'astonmartin', 'audi', 'bentley', 'bmw', 'byd', 'cadillac', 'chevrolet', 'chrysler', 'citroen', 'cupra', 'dacia', 'daf', 'dodge', 'ds', 'ferrari',
+                    'fiat', 'ford', 'genesis', 'gmc', 'honda', 'hyundai', 'infiniti', 'isuzu', 'iveco', 'jaguar', 'jeep', 'kia', 'lada', 'lamborghini', 'lancia', 'landrover', 'lexus',
+                    'lotus', 'lynkco', 'man', 'maserati', 'mazda', 'mclaren', 'mercedesbenz', 'mg', 'mini', 'mitsubishi', 'nio', 'nissan', 'opel', 'peugeot', 'polestar', 'porsche',
+                    'ram', 'renault', 'rollsroyce', 'saab', 'scania', 'seat', 'skoda', 'smart', 'ssangyong', 'subaru', 'suzuki', 'tesla', 'toyota', 'vauxhall', 'volkswagen', 'volvo', 'xpeng', 'zeekr']
+          ALIAS = {'vw': 'volkswagen', 'mercedes': 'mercedesbenz', 'daimler': 'mercedesbenz', 'mb': 'mercedesbenz', 'alfa': 'alfaromeo', 'rangerover': 'landrover', 'kgmobility': 'ssangyong'}
+
+
+          def slug(s):
+              s = unicodedata.normalize('NFKD', (s or '').lower())
+              s = ''.join(ch for ch in s if not unicodedata.combining(ch))
+              return re.sub(r'[^a-z0-9]+', '', s)
+
+
+          def brands_of(s):
+              # «Ford-Werke GmbH» → [ford]; «1. Land Rover 2. Range Rover» → [landrover]; неизвестная марка → [как есть]
+              x = slug(s)
+              for a, b in ALIAS.items():
+                  if x == a or x.startswith(a):
+                      return [b]
+              for b in sorted(BRANDS, key=len, reverse=True):
+                  if x.startswith(b):
+                      return [b]
+              inside = [b for b in BRANDS if len(b) >= 3 and b in x]
+              inside += [b for a, b in ALIAS.items() if len(a) >= 4 and a in x and b not in inside]
+              return inside or ([x] if x else [])
+
+
+          def get(url, timeout=120):
+              with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=timeout) as r:
+                  return r.read()
+
+
+          def text(n, tag):
+              x = n.find(tag)
+              return re.sub(r'\s+', ' ', (x.text or '')).strip() if x is not None and x.text else ''
+
+
+          # ---------- что уже есть ----------
+          items, done = {}, set()
+          if PREV:
+              try:
+                  for a in json.loads(gzip.decompress(get(PREV.rstrip('/') + '/all.json.gz', 60)).decode('utf-8')):
+                      items[a['c']] = a
+                  done = set(json.loads(get(PREV.rstrip('/') + '/state.json', 60).decode('utf-8')))
+                  print('было отзывов:', len(items), 'недель:', len(done), flush=True)
+              except Exception as e:
+                  print('старых данных нет:', e, flush=True)
+
+          # ---------- список еженедельных отчётов ----------
+          root = ET.fromstring(get(LIST))
+          reports = []
+          for w in root.iter('weeklyReport'):
+              ref, url = text(w, 'reference'), text(w, 'URL')
+              if ref and url and ref not in done:
+                  reports.append((ref, url))
+          if MAX:
+              reports = reports[:MAX]
+          print('новых отчётов:', len(reports), flush=True)
+
+
+          def one(rep):
+              ref, url = rep
+              try:
+                  x = ET.fromstring(get(url, 180))
+              except Exception as e:
+                  return ref, None, str(e)
+              d = text(x, 'report_date')
+              m = re.match(r'(\d{2})/(\d{2})/(\d{4})', d)
+              iso = '%s-%s-%s' % (m.group(3), m.group(2), m.group(1)) if m else ''
+              out = []
+              for n in x.iter('notifications'):
+                  if text(n, 'category') != 'Motor vehicles':
+                      continue
+                  out.append({'c': text(n, 'caseNumber'), 'd': iso, 'b': text(n, 'brand'), 'm': text(n, 'name'), 't': text(n, 'type_numberOfModel'),
+                              'p': text(n, 'productionDates'), 'r': text(n, 'riskType'), 'x': text(n, 'danger')[:900], 's': text(n, 'measures')[:300],
+                              'k': text(n, 'companyRecallCode'), 'n': text(n, 'notifyingCountry'), 'o': text(n, 'countryOfOrigin'), 'u': text(n, 'reference')})
+              return ref, out, ''
+
+
+          errors = 0
+          with concurrent.futures.ThreadPoolExecutor(6) as ex:
+              for ref, out, err in ex.map(one, reports):
+                  if out is None:
+                      errors += 1
+                      print('ошибка', ref, err, flush=True)
+                      continue
+                  done.add(ref)
+                  for a in out:
+                      if a['c']:
+                          items[a['c']] = a
+
+          if len(items) < (1 if MAX else 500):
+              sys.exit('слишком мало отзывов: %d — не публикуем' % len(items))
+
+          # ---------- файлы по маркам ----------
+          by = {}
+          for a in items.values():
+              for b in brands_of(a['b']):
+                  by.setdefault(b, []).append(a)
+          for b, lst in by.items():
+              if not b:
+                  continue
+              lst.sort(key=lambda a: a['d'], reverse=True)
+              with gzip.open(os.path.join(OUT, b + '.json.gz'), 'wt', encoding='utf-8') as g:
+                  json.dump(lst, g, ensure_ascii=False)
+          with gzip.open(os.path.join(OUT, 'all.json.gz'), 'wt', encoding='utf-8') as g:
+              json.dump(sorted(items.values(), key=lambda a: a['d'], reverse=True), g, ensure_ascii=False)
+          with open(os.path.join(OUT, 'state.json'), 'w', encoding='utf-8') as f:
+              json.dump(sorted(done), f)
+          with open(os.path.join(OUT, 'info.txt'), 'w', encoding='utf-8') as f:
+              f.write('%s;%d;%d\n' % (datetime.date.today().isoformat(), len(items), len(by)))
+          with open(os.path.join(OUT, 'SOURCE.txt'), 'w', encoding='utf-8') as f:
+              f.write('Source: European Commission, Safety Gate weekly reports (ec.europa.eu/safety-gate-alerts), category "Motor vehicles". Reuse: Commission Decision 2011/833/EU.\n')
+          print('отзывов машин:', len(items), 'марок:', len(by), 'ошибок:', errors)
+          PY
+          # старые отзывы и список обработанных недель — с прошлой версии ветки (если есть)
+          python3 eu_recalls.py out/eu-recalls "https://raw.githubusercontent.com/$REPO/eu-recalls/"
+
+      - name: Выложить в ветку eu-recalls
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ ! -f out/eu-recalls/info.txt ]; then echo "нет данных"; exit 0; fi
+          cd out/eu-recalls
+          git init -q
+          git checkout -q -b eu-recalls
+          git add .
+          git -c user.name='mirror-bot' -c user.email='mirror-bot@users.noreply.github.com' commit -qm "eu-recalls $(date -u +%F)"
+          git push -qf "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" eu-recalls
