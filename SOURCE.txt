@@ -1,0 +1,2 @@
+Zdroj: Ministerstvo dopravy ČR, Registr silničních vozidel — otevřená data (download.dataovozidlech.cz), zákon č. 106/1999 Sb.
+Data upravena: jen M1/N1 s VIN, seskupeno podle VIN, bez jmen, adres a IČO vlastníků.
